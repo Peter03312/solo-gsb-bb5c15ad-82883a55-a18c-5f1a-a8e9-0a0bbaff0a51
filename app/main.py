@@ -41,6 +41,7 @@ from .schemas import (
     PassIssueRequest,
     PassOut,
     RegionBatchRequest,
+    RegionBatchPreviewResponse,
     RegionBatchResponse,
     RegionChangePage,
     RegionCreate,
@@ -68,8 +69,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.8.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据。",
+    version="1.9.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可在正式提交多区调整前做批量变更影响预演（只读）：基于同一已提交快照与基准时刻，报告各轨迹在拟变更完整集合下的安全结论与穿越明细、将冲突的有效通行凭证、将被清空未来安全时刻的择时承诺与有效观察的结论净翻转，预演不改变任何数据、不占用区域编号。",
     lifespan=lifespan,
 )
 
@@ -146,7 +147,11 @@ def _error_response(status: int, code: str, message: str, details=None) -> JSONR
 
 
 def _crossings_to_out(results: list[dict]) -> list[dict]:
-    """把几何层结果（穿越时刻为 epoch 秒）转成 API 输出（UTC datetime）。"""
+    """把几何层结果（穿越时刻为 epoch 秒）转成 API 输出（UTC datetime）。
+
+    结果中若带 operation_index（批量变更影响预演为拟登记/修订区域标注的
+    操作下标）则原样透传。
+    """
     out_results = []
     for r in results:
         crossings = []
@@ -158,11 +163,14 @@ def _crossings_to_out(results: list[dict]) -> list[dict]:
                 "exit_inclusive": c["exit_inclusive"],
                 "point_contact": c["point_contact"],
             })
-        out_results.append({
+        item = {
             "region_id": r["region_id"],
             "region_name": r["region_name"],
             "crossings": crossings,
-        })
+        }
+        if "operation_index" in r:
+            item["operation_index"] = r["operation_index"]
+        out_results.append(item)
     return out_results
 
 
@@ -820,6 +828,80 @@ def batch_change_regions(payload: RegionBatchRequest,
     return response
 
 
+@app.post("/api/regions/batch/preview", response_model=RegionBatchPreviewResponse,
+          responses={
+              409: {"description": "expected_revision 已过期（revision_conflict）"},
+              404: {"description": "批内引用了不存在的区域（region_not_found）"},
+          },
+          tags=["regions"])
+def preview_batch_change(payload: RegionBatchRequest):
+    """批量变更影响预演（只读）：正式提交多区调整前的影响评估。
+
+    请求结构与 `POST /api/regions/batch` 相同（`expected_revision`、按序
+    `operations`、`trajectories`）；整个计算在单个
+    `REPEATABLE READ READ ONLY` 事务内基于**同一已提交快照**与**同一基准
+    时刻**完成，报告：
+
+    * 各轨迹在**拟变更完整区域集合**下的安全结论与逐区域穿越明细
+      （拟登记区域不分配正式编号：`region_id` 为 null，以 `operation_index`
+      即操作下标标识；修订区域同时带 `region_id` 与 `operation_index`）；
+    * 若提交将冲突的有效通行凭证（未取消且末点时刻未过）；
+    * 变更前仍有未来安全时刻、变更后被清空的有效择时承诺；
+    * 有效观察（未取消且末点时刻未过）的结论净翻转（旧/新结论）；
+    * `committable`：以本次快照与基准时刻衡量，若立即正式提交是否会通过
+      全部校验（轨迹安全且无凭证/承诺冲突；观察翻转不阻止提交）。
+
+    错误约定与正式批量变更一致：过期 revision（409 `revision_conflict`）、
+    重复区域（422 `duplicate_region`）、未知区域（404 `region_not_found`）、
+    非法操作（422 `invalid_operation`）、非法轨迹（422
+    `invalid_trajectory`/`validation_error`）。
+
+    预演不改变区域、凭证、承诺、观察、审计记录与全局 revision，也不占用
+    区域编号；报告不保证之后可提交——正式提交仍按现有保护规则重验。
+    """
+    # 轨迹合法性（点数、有限坐标、时刻严格递增）在几何层统一报错，与正式批量一致
+    trajectories = [
+        geometry.validate_trajectory(points, lambda p: p.t)
+        for points in payload.trajectories
+    ]
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            # REPEATABLE READ 只读事务：revision、区域、凭证/承诺/观察来自同一
+            # 已提交快照；预演期间并发的变更不影响本次计算，本次计算不写任何数据
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                report = repository.preview_batch(cur, payload, trajectories)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    return RegionBatchPreviewResponse(
+        revision=report["revision"],
+        computed_at=report["computed_at"],
+        committable=report["committable"],
+        operations=report["operations"],
+        trajectories=[
+            {
+                "index": check["index"],
+                "safe": check["safe"],
+                "results": _crossings_to_out(check["results"]),
+            }
+            for check in report["trajectory_results"]
+        ],
+        conflicting_passes=[
+            {"pass_id": pid} for pid in report["conflicting_pass_ids"]
+        ],
+        conflicting_commitments=[
+            {"commitment_id": cid} for cid in report["conflicting_commitment_ids"]
+        ],
+        observation_flips=report["observation_flips"],
+    )
+
+
 # ---------------------------------------------------------------- 通行凭证
 
 @app.post("/api/passes", response_model=PassOut, status_code=201,
@@ -1387,7 +1469,7 @@ def root():
         "endpoints": [
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
-            "POST /api/regions/batch",
+            "POST /api/regions/batch", "POST /api/regions/batch/preview",
             "GET /api/regions/changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/exemptions/preview",

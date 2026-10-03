@@ -459,6 +459,86 @@ class RegionBatchResponse(_UTCDatetimeModel):
     trajectories: list[TrajectoryCheckOut]
 
 
+# ---------------------------------------------------------------- 批量变更影响预演
+
+class BatchPreviewOperationOut(BaseModel):
+    """预演中的单个操作回显。
+
+    create 不分配正式编号：region_id 为 null，以 index（操作下标）标识；
+    version 为若提交将产生的版本（create=1、update=当前版本+1、
+    delete=删除前版本）。
+    """
+
+    index: int
+    action: str
+    region_id: int | None
+    version: int | None = None
+
+
+class BatchPreviewRegionResultOut(_UTCDatetimeModel):
+    """预演轨迹核验的逐区域结果。
+
+    region_id 为现有区域编号；拟登记区域（create 操作）不分配正式编号，
+    region_id 为 null，以 operation_index（操作下标）标识。
+    operation_index 为本批 create/update 引入该区域形态的操作下标；
+    未被本批涉及的区域为 null。
+    """
+
+    region_id: int | None
+    operation_index: int | None
+    region_name: str
+    crossings: list[CrossingOut]
+
+
+class BatchPreviewTrajectoryOut(_UTCDatetimeModel):
+    """预演中单条轨迹对拟变更完整集合的核验结果。"""
+
+    index: int
+    safe: bool
+    results: list[BatchPreviewRegionResultOut]
+
+
+class BatchPreviewPassConflictOut(BaseModel):
+    """若提交将冲突的有效通行凭证（未取消且末点时刻未过）。"""
+
+    pass_id: int
+
+
+class BatchPreviewCommitmentConflictOut(BaseModel):
+    """变更前仍有未来安全时刻、若提交将被清空的有效择时承诺
+    （未取消且窗口未结束）。"""
+
+    commitment_id: int
+
+
+class BatchPreviewObservationFlipOut(BaseModel):
+    """有效观察（未取消且末点时刻未过）在拟变更前后的结论净翻转。"""
+
+    observation_id: int
+    old_conclusion: str
+    new_conclusion: str
+
+
+class RegionBatchPreviewResponse(_UTCDatetimeModel):
+    """批量变更影响预演报告（只读，不产生任何副作用）。
+
+    revision 为预演所依据的已提交快照版本（与请求的 expected_revision
+    一致）；computed_at 为评估凭证/承诺/观察所用的同一基准时刻；
+    committable 表示以本次快照与基准时刻衡量，若立即正式提交是否会通过
+    全部校验（轨迹安全且无凭证/承诺冲突；观察翻转不阻止提交）——
+    不保证之后正式提交仍可通过，正式提交仍按既有保护规则重验。
+    """
+
+    revision: int
+    computed_at: datetime
+    committable: bool
+    operations: list[BatchPreviewOperationOut]
+    trajectories: list[BatchPreviewTrajectoryOut]
+    conflicting_passes: list[BatchPreviewPassConflictOut]
+    conflicting_commitments: list[BatchPreviewCommitmentConflictOut]
+    observation_flips: list[BatchPreviewObservationFlipOut]
+
+
 class RevisionOut(BaseModel):
     revision: int
 

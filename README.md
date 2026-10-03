@@ -17,7 +17,7 @@
 编号、当前安全结论与区域 revision；单区及批量区域变更成功时，对未取消且
 末点未过的观察比较变更前后安全结论，**仅结论翻转**才在**同一事务**留一条
 含观察编号、旧/新结论与新 revision 的事件（整批至多一条/观察）；观察
-**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。此外，安全员可为一条固定行程做**最小区域豁免预演**（只读）：输入相对秒数轨迹、带时区候选出发窗口、可豁免的互异现有区域编号与已读 revision，系统在候选区域的子集中找出使窗口内至少存在安全出发时刻的方案（豁免数最少、最早安全时刻、编号字典序），返回所据 revision、豁免编号、最早安全时刻与完整安全出发区间；预演不改变任何数据。
+**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。此外，安全员可为一条固定行程做**最小区域豁免预演**（只读）：输入相对秒数轨迹、带时区候选出发窗口、可豁免的互异现有区域编号与已读 revision，系统在候选区域的子集中找出使窗口内至少存在安全出发时刻的方案（豁免数最少、最早安全时刻、编号字典序），返回所据 revision、豁免编号、最早安全时刻与完整安全出发区间；预演不改变任何数据。安全员还可在正式提交多区调整前做**批量变更影响预演**（只读）：输入与批量变更相同（预期 revision、按序登记/修订/删除操作、待核验轨迹），报告基于同一已提交快照与同一基准时刻，给出各轨迹在拟变更完整区域集合下的安全结论与穿越明细、若提交将冲突的有效通行凭证、变更前仍有未来安全时刻而变更后被清空的择时承诺，以及有效观察的结论净翻转（旧/新结论）；拟登记区域以操作下标标识、不分配正式编号，预演不改变任何数据，也不占用编号。
 
 ## 核验规则
 
@@ -74,6 +74,46 @@
 | 409 | `pass_conflict` | 变更后集合将使未取消且未结束的凭证不安全；details 列出冲突凭证 id |
 | 409 | `commitment_conflict` | 变更后集合将抹掉未取消且窗口未结束承诺的全部未来安全出发时刻；details 列出冲突承诺 id |
 | 422 | `validation_error` / `invalid_polygon` / `invalid_trajectory` | 结构/多边形/轨迹非法（同既有接口） |
+
+## 批量变更影响预演规则（`POST /api/regions/batch/preview`）
+
+安全员在正式提交多区调整前，可以基于**同一已提交快照**做一次**只读影响
+预演**：输入与批量变更相同，系统报告若提交将产生的影响，但不落任何数据。
+
+* **请求**：与 `POST /api/regions/batch` 完全相同（`expected_revision`、
+  按序 `operations`、`trajectories`）。
+* **计算**：整个预演在单个 `REPEATABLE READ READ ONLY` 事务内完成——
+  revision、区域集合、凭证、承诺、观察均来自**同一已提交快照**，凭证/
+  承诺/观察的评估共用**同一基准时刻**（响应中的 `computed_at`）；
+  预演期间并发的区域变更不影响本次计算。
+* **报告**（HTTP 200）：
+  * `revision`：预演所依据的快照版本（与 `expected_revision` 一致）；
+  * `computed_at`：评估凭证/承诺/观察所用的基准时刻；
+  * `operations`：逐操作回显（`index/action/region_id/version`）；
+    **拟登记区域不分配正式编号**（`region_id` 为 null，以操作下标
+    标识），`version` 为若提交将产生的版本（create=1、update=当前
+    版本+1、delete=删除前版本）；
+  * `trajectories`：各轨迹在**拟变更完整区域集合**下的安全结论与逐
+    区域穿越明细（沿用直线匀速、边界接触即穿越、生效时段左闭右开规则；
+    结果中 `region_id` 为现有区域编号、拟登记区域为 null，
+    `operation_index` 为引入该区域形态的操作下标、未涉及区域为 null）；
+  * `conflicting_passes`：若提交将冲突的有效通行凭证（未取消且末点
+    时刻未过）；
+  * `conflicting_commitments`：变更前仍有未来安全时刻、变更后被清空
+    的有效择时承诺（未取消且窗口未结束）；
+  * `observation_flips`：有效观察（未取消且末点时刻未过）的结论净
+    翻转（`old_conclusion`/`new_conclusion`）；
+  * `committable`：以本次快照与基准时刻衡量，若立即正式提交是否会
+    通过全部校验（轨迹安全且无凭证/承诺冲突；观察翻转不阻止提交）。
+* **错误约定与正式批量变更一致**：过期 revision → 409
+  `revision_conflict`（details 带当前值）；同一现有区域出现多次 → 422
+  `duplicate_region`；引用不存在的区域 → 404 `region_not_found`；单条
+  操作非法 → 422 `invalid_operation`；轨迹非法 → 422
+  `invalid_trajectory`/`validation_error`。
+* **只读无副作用**：预演不改变区域、凭证、承诺、观察、审计记录与全局
+  revision，也不占用区域编号（不消耗序列）；只读接口不占用幂等键。
+* **不保证可提交**：报告只是某一快照时刻的评估；正式提交仍须按现有
+  保护规则（revision 比对、轨迹核验、凭证与承诺保护）重新验证。
 
 ## 通行凭证规则（签发 / 查询 / 取消）
 
@@ -529,6 +569,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | PATCH | `/api/regions/{id}` | 修订区域（字段任意组合，部分更新）；`version` +1；支持幂等键 |
 | DELETE | `/api/regions/{id}` | 删除区域；支持幂等键 |
 | POST | `/api/regions/batch` | 多处区域登记/修订/删除一次原子提交，并核验指定轨迹全部安全；支持幂等键 |
+| POST | `/api/regions/batch/preview` | 批量变更影响预演（只读）：报告轨迹结论与穿越明细、凭证/承诺冲突与观察净翻转，不落库、不占编号 |
 | GET | `/api/regions/changes` | 区域集合变更只读审计历史：按全局 revision 游标升序分页 |
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
@@ -709,6 +750,88 @@ curl -X POST http://localhost:8000/api/regions \
   revision 不变。
 * 若变更后集合会使某张未取消且未结束的通行凭证不再安全，返回 **409**
   `pass_conflict`（见下节），整批回滚。
+
+### 批量变更影响预演 `POST /api/regions/batch/preview`
+
+正式提交多区调整前的**只读**影响评估。请求结构与 `POST /api/regions/batch`
+完全相同；整个计算在单个 `REPEATABLE READ READ ONLY` 事务内基于同一
+已提交快照与同一基准时刻完成，不改变任何数据、不占用区域编号。
+
+请求（与批量变更同一结构）：
+
+```json
+{
+  "expected_revision": 2,
+  "operations": [
+    {
+      "action": "create",
+      "name": "C区-新作业面",
+      "polygon": [[0, 150], [100, 150], [100, 250], [0, 250]],
+      "valid_from": "2026-10-01T00:00:00Z",
+      "valid_to":   "2026-11-01T00:00:00Z"
+    },
+    {"action": "delete", "id": 2}
+  ],
+  "trajectories": [
+    [
+      {"x": -50, "y": 200, "t": "2026-10-02T00:00:00Z"},
+      {"x": 900, "y": 200, "t": "2026-10-02T00:02:00Z"}
+    ]
+  ]
+}
+```
+
+响应（HTTP 200）：拟登记区域以操作下标标识（`region_id` 为 null），
+报告同时列出若提交将冲突的凭证、将被清空未来安全时刻的承诺与有效观察
+的结论净翻转：
+
+```json
+{
+  "revision": 2,
+  "computed_at": "2026-09-30T12:00:00Z",
+  "committable": false,
+  "operations": [
+    {"index": 0, "action": "create", "region_id": null, "version": 1},
+    {"index": 1, "action": "delete", "region_id": 2, "version": 3}
+  ],
+  "trajectories": [
+    {
+      "index": 0,
+      "safe": false,
+      "results": [
+        {"region_id": 1, "operation_index": null, "region_name": "A区", "crossings": []},
+        {
+          "region_id": null,
+          "operation_index": 0,
+          "region_name": "C区-新作业面",
+          "crossings": [
+            {
+              "entry_time": "2026-10-02T00:00:15Z",
+              "exit_time": "2026-10-02T00:00:45Z",
+              "entry_inclusive": true,
+              "exit_inclusive": true,
+              "point_contact": false
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "conflicting_passes": [{"pass_id": 1}],
+  "conflicting_commitments": [{"commitment_id": 1}],
+  "observation_flips": [
+    {"observation_id": 1, "old_conclusion": "unsafe", "new_conclusion": "safe"}
+  ]
+}
+```
+
+* `committable=true` 表示以本次快照与基准时刻衡量，同一内容若立即正式
+  提交会通过全部校验（轨迹安全且无凭证/承诺冲突）；**不保证之后可提交**，
+  正式提交仍按现有保护规则重验。
+* 错误契约与正式批量变更一致：过期 revision 409 `revision_conflict`、
+  重复区域 422 `duplicate_region`、未知区域 404 `region_not_found`、
+  非法操作 422 `invalid_operation`、非法轨迹 422
+  `invalid_trajectory`/`validation_error`；预演失败同样不落任何数据。
 
 ### 通行凭证 `POST /api/passes`
 
@@ -1006,6 +1129,9 @@ revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。�
 `invalid_trajectory`，候选时段不递增返回 `invalid_input`；
 `/api/regions/batch` 另用 `revision_conflict`（409）、`region_not_found`（404）、
 `duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
+`/api/regions/batch/preview` 沿用批量变更的错误约定（`revision_conflict`/
+`region_not_found`/`duplicate_region`/`invalid_operation`），但轨迹不安全、
+凭证/承诺冲突在预演中是**报告内容**而非错误；
 凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
 `not_found`（404，未知凭证 ID）；
 择时承诺另用 `commitment_conflict`（409，区域变更抹掉未结束承诺窗口内的
@@ -1037,6 +1163,11 @@ bash examples/curl_examples.sh
 
 # 批量原子变更（登记/修订/删除 + 轨迹核验；含不安全拒绝、revision 冲突重放）
 bash examples/curl_batch.sh
+
+# 批量变更影响预演（只读：轨迹结论与穿越明细、凭证/承诺冲突、观察净翻转、
+# committable 汇总；拟登记区域以操作下标标识；错误契约与正式批量一致；
+# 预演无副作用，正式提交仍按保护规则重验）
+bash examples/curl_batch_preview.sh
 
 # 通行凭证（签发/查询/取消；含 409 pass_conflict 约束、幂等取消、
 # 不安全与已开始轨迹拒签）
@@ -1087,6 +1218,11 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 同样会清空 regions 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_batch_api.py
 
+# 批量变更影响预演 API 集成测试（报告口径、拟登记区域操作下标标识、
+# 凭证/承诺/观察影响列表、错误契约与正式批量一致、预演无副作用且不占用
+# 编号、预演与正式提交口径一致，会清空全部业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_batch_preview_api.py
+
 # 通行凭证 API 集成测试（签发/查询/取消、凭证约束区域变更、过期放行、
 # 签发与区域写入并发串行化，会清空 regions/passes 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_passes_api.py
@@ -1122,12 +1258,12 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、最小区域豁免预演、batch、passes、commitments、observations、区域变更审计历史、幂等键）
-  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型、区域变更审计分页模型、豁免预演模型）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、最小区域豁免预演、batch、批量变更影响预演、passes、commitments、observations、区域变更审计历史、幂等键）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、批量变更影响预演报告模型、观察与事件分页模型、区域变更审计分页模型、豁免预演模型）
   geometry.py    # 穿越核验、安全出发区间与最小区域豁免预演引擎（插值、裁剪、合并、区间差、等覆盖基本段枚举）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、批量变更影响预演（只读）、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
   db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/observations/observation_events/idempotency_keys/region_change_audit）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察、区域集合变更审计历史、最小区域豁免预演与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/区域变更审计历史/最小区域豁免预演/幂等键集成测试
+examples/        # curl 与 Python 调用示例（含批量原子变更、批量变更影响预演、通行凭证、择时承诺、安全状态观察、区域集合变更审计历史、最小区域豁免预演与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/批量变更影响预演/通行凭证/择时承诺/安全状态观察/区域变更审计历史/最小区域豁免预演/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```

@@ -451,7 +451,12 @@ def idempotency_store(cur, key: str, status_code: int, response_body: str) -> No
 # ---------------------------------------------------------------- 批量原子变更
 
 def _load_all_regions_locked(cur) -> dict[int, dict]:
-    """读取全部区域（调用方应已持有 region_meta 行锁，保证期间无并发写）。"""
+    """读取全部区域。
+
+    调用方须保证读取期间集合稳定：写路径已持有 region_meta 行锁（期间无
+    并发写）；批量变更影响预演在 REPEATABLE READ 只读快照内调用，同样读到
+    同一已提交版本的稳定集合。
+    """
     cur.execute(
         """
         SELECT id, name, polygon, valid_from, valid_to, version,
@@ -815,17 +820,27 @@ def load_constraining_passes(cur, now: datetime) -> list[dict]:
     return passes
 
 
-def check_passes_safe(cur, regions: list[dict], now: datetime) -> None:
-    """核验未取消且未结束的凭证轨迹在给定区域集合下仍然安全。
+def find_conflicting_passes(cur, regions: list[dict], now: datetime) -> list[int]:
+    """未取消且末点时刻未过的凭证中，轨迹在给定区域集合下不再安全的凭证 id。
 
-    任一凭证发生穿越（沿用直线匀速、边界接触即违规、生效期左闭右开规则）
-    即抛 PassConflict，调用方应回滚整笔变更。
+    只读计算（沿用直线匀速、边界接触即违规、生效期左闭右开规则）；
+    写路径（check_passes_safe）与批量变更影响预演共用。
     """
     conflicts: list[int] = []
     for p in load_constraining_passes(cur, now):
         results = geometry.verify_trajectory(p["trajectory"], regions)
         if any(r["crossings"] for r in results):
             conflicts.append(p["id"])
+    return conflicts
+
+
+def check_passes_safe(cur, regions: list[dict], now: datetime) -> None:
+    """核验未取消且未结束的凭证轨迹在给定区域集合下仍然安全。
+
+    任一凭证发生穿越（沿用直线匀速、边界接触即违规、生效期左闭右开规则）
+    即抛 PassConflict，调用方应回滚整笔变更。
+    """
+    conflicts = find_conflicting_passes(cur, regions, now)
     if conflicts:
         raise PassConflict(conflicts)
 
@@ -961,19 +976,18 @@ def _load_constraining_commitments(cur, now: datetime) -> list[dict]:
     return commitments
 
 
-def check_commitments_safe(
+def find_conflicting_commitments(
     cur,
     regions_before: list[dict],
     regions_after: list[dict],
     now: datetime,
-) -> None:
-    """区域变更不得抹去承诺窗口内剩余的全部安全出发时刻。
+) -> list[int]:
+    """变更前仍有未来安全时刻、变更后一点不剩的未结束承诺 id（只读计算）。
 
     对每张未取消且窗口未结束的承诺，分别用变更前、变更后的完整区域集合
-    重算「当前时刻之后」的安全出发区间（同一 now，同一写事务内）：
-    变更前仍有未来安全时刻、变更后一点不剩时，该承诺冲突；
-    变更前已无未来安全时刻的承诺不再约束（窗口虽未结束，但已无可保护之物）。
-    任一冲突即抛 CommitmentConflict，调用方应回滚整笔变更。
+    重算「当前时刻之后」的安全出发区间（同一 now）；变更前已无未来安全
+    时刻的承诺不再约束。写路径（check_commitments_safe）与批量变更影响
+    预演共用。
     """
     now_epoch = now.timestamp()
     conflicts: list[int] = []
@@ -991,6 +1005,26 @@ def check_commitments_safe(
         )
         if not after:
             conflicts.append(c["id"])
+    return conflicts
+
+
+def check_commitments_safe(
+    cur,
+    regions_before: list[dict],
+    regions_after: list[dict],
+    now: datetime,
+) -> None:
+    """区域变更不得抹去承诺窗口内剩余的全部安全出发时刻。
+
+    对每张未取消且窗口未结束的承诺，分别用变更前、变更后的完整区域集合
+    重算「当前时刻之后」的安全出发区间（同一 now，同一写事务内）：
+    变更前仍有未来安全时刻、变更后一点不剩时，该承诺冲突；
+    变更前已无未来安全时刻的承诺不再约束（窗口虽未结束，但已无可保护之物）。
+    任一冲突即抛 CommitmentConflict，调用方应回滚整笔变更。
+    """
+    conflicts = find_conflicting_commitments(
+        cur, regions_before, regions_after, now
+    )
     if conflicts:
         raise CommitmentConflict(conflicts)
 
@@ -1125,6 +1159,35 @@ def load_constraining_observations(cur, now: datetime) -> list[dict]:
     return observations
 
 
+def compute_observation_flips(
+    cur,
+    regions_before: list[dict],
+    regions_after: list[dict],
+    now: datetime,
+) -> list[dict]:
+    """未取消且末点时刻未过的观察在变更前/后完整集合下的结论净翻转（只读）。
+
+    返回 [{"observation_id", "old_conclusion", "new_conclusion"}, ...]，
+    按观察 id 升序；仅结论翻转（safe↔unsafe）的观察入列，结论不变不出现。
+    已取消或末点时刻已过的观察不参与。写路径（record_observation_flips）
+    与批量变更影响预演共用。
+    """
+    flips: list[dict] = []
+    for obs in load_constraining_observations(cur, now):
+        before_results = geometry.verify_trajectory(obs["trajectory"], regions_before)
+        old_safe = all(not r["crossings"] for r in before_results)
+        after_results = geometry.verify_trajectory(obs["trajectory"], regions_after)
+        new_safe = all(not r["crossings"] for r in after_results)
+        if old_safe == new_safe:
+            continue
+        flips.append({
+            "observation_id": obs["id"],
+            "old_conclusion": "safe" if old_safe else "unsafe",
+            "new_conclusion": "safe" if new_safe else "unsafe",
+        })
+    return flips
+
+
 def record_observation_flips(
     cur,
     regions_before: list[dict],
@@ -1143,22 +1206,15 @@ def record_observation_flips(
     已取消或末点时刻已过的观察不再核验、不再产生事件。
     本函数不改变区域数据；调用方事务回滚时事件与结论更新一并消失。
     """
-    for obs in load_constraining_observations(cur, now):
-        before_results = geometry.verify_trajectory(obs["trajectory"], regions_before)
-        old_safe = all(not r["crossings"] for r in before_results)
-        after_results = geometry.verify_trajectory(obs["trajectory"], regions_after)
-        new_safe = all(not r["crossings"] for r in after_results)
-        if old_safe == new_safe:
-            continue
-        old_conclusion = "safe" if old_safe else "unsafe"
-        new_conclusion = "safe" if new_safe else "unsafe"
+    for flip in compute_observation_flips(cur, regions_before, regions_after, now):
+        obs_id = flip["observation_id"]
         cur.execute(
             """
             SELECT coalesce(max(seq), 0) AS last_seq
             FROM observation_events
             WHERE observation_id = %s
             """,
-            (obs["id"],),
+            (obs_id,),
         )
         next_seq = int(cur.fetchone()["last_seq"]) + 1
         cur.execute(
@@ -1167,7 +1223,8 @@ def record_observation_flips(
                 (observation_id, seq, old_conclusion, new_conclusion, revision)
             VALUES (%s, %s, %s, %s, %s)
             """,
-            (obs["id"], next_seq, old_conclusion, new_conclusion, new_revision),
+            (obs_id, next_seq, flip["old_conclusion"], flip["new_conclusion"],
+             new_revision),
         )
         cur.execute(
             """
@@ -1175,7 +1232,7 @@ def record_observation_flips(
             SET conclusion = %s, conclusion_revision = %s
             WHERE id = %s
             """,
-            (new_conclusion, new_revision, obs["id"]),
+            (flip["new_conclusion"], new_revision, obs_id),
         )
 
 
@@ -1277,3 +1334,170 @@ def list_observation_events(
     rows = cur.fetchall()
     has_more = len(rows) > limit
     return rows[:limit], has_more
+
+
+# ---------------------------------------------------------------- 批量变更影响预演（只读）
+
+def preview_batch(cur, payload, trajectories: list[list[tuple[float, float, float]]]) -> dict:
+    """批量变更影响预演：与正式批量变更同一套校验与核验规则，但只读不落库。
+
+    调用方须在 REPEATABLE READ READ ONLY 事务内调用：revision、区域集合、
+    凭证/承诺/观察均来自同一已提交快照；不取行锁、不写库、不推进 revision，
+    也不为拟登记区域分配正式编号（不占用序列，以操作下标标识）。
+    payload/trajectories 语义与 apply_batch 相同；错误约定与正式批量变更
+    一致（BatchRevisionConflict/BatchDuplicateRegion/BatchRegionsNotFound/
+    BatchInvalidOperation；轨迹非法由几何层在调用前统一抛出）。
+    返回 {"revision", "computed_at", "committable", "operations",
+          "trajectory_results", "conflicting_pass_ids",
+          "conflicting_commitment_ids", "observation_flips"}。
+    """
+    # 1) 快照 revision（只读，不锁 meta 行；REPEATABLE READ 保证与数据同一快照）
+    current_revision = get_revision_shared(cur)
+    if current_revision != payload.expected_revision:
+        raise BatchRevisionConflict(payload.expected_revision, current_revision)
+
+    operations = payload.operations
+
+    # 2) 同一现有区域在一批中只能出现一次（create 不占现有 id）
+    seen: dict[int, int] = {}
+    for i, op in enumerate(operations):
+        if isinstance(op, (RegionUpdateInBatch, RegionDeleteInBatch)):
+            rid = op.region_id
+            if rid in seen:
+                raise BatchDuplicateRegion(rid, [seen[rid], i])
+            seen[rid] = i
+
+    # 3) 快照内当前完整集合（只读事务不取行锁，稳定性由快照保证）
+    current = _load_all_regions_locked(cur)
+    missing = [
+        {"index": i, "region_id": rid}
+        for rid, i in sorted(((rid, seen[rid]) for rid in seen),
+                             key=lambda kv: kv[1])
+        if rid not in current
+    ]
+    if missing:
+        raise BatchRegionsNotFound(missing)
+
+    # 4) 在内存中构造每条操作应用后的区域形态：不写库、不分配正式编号
+    op_results: list[dict] = []
+    for i, op in enumerate(operations):
+        if isinstance(op, RegionCreateInBatch):
+            try:
+                op.validate_time_order()
+            except ValueError as exc:
+                raise BatchInvalidOperation(i, str(exc), "valid_from") from exc
+            op_results.append({
+                "index": i,
+                "action": "create",
+                "region_id": None,  # 拟登记区域不分配正式编号，以操作下标标识
+                "version": 1,
+                "_geom": {
+                    "id": None,
+                    "name": op.name,
+                    "valid_from": _epoch(op.valid_from),
+                    "valid_to": _epoch(op.valid_to),
+                    "polygon": Polygon(op.polygon),
+                },
+            })
+        elif isinstance(op, RegionUpdateInBatch):
+            row = current[op.region_id]
+            name = op.name if op.name is not None else row["name"]
+            valid_from = op.valid_from if op.valid_from is not None else row["valid_from"]
+            valid_to = op.valid_to if op.valid_to is not None else row["valid_to"]
+            if valid_from >= valid_to:
+                raise BatchInvalidOperation(
+                    i,
+                    "生效时段必须满足 valid_from < valid_to（左闭右开，起早于止）",
+                    "valid_from",
+                )
+            polygon = (
+                Polygon(op.polygon)
+                if op.polygon is not None
+                else geometry.polygon_from_wkt(row["wkt"])
+            )
+            op_results.append({
+                "index": i,
+                "action": "update",
+                "region_id": op.region_id,
+                "version": int(row["version"]) + 1,
+                "_geom": {
+                    "id": op.region_id,
+                    "name": name,
+                    "valid_from": _epoch(valid_from),
+                    "valid_to": _epoch(valid_to),
+                    "polygon": polygon,
+                },
+            })
+        else:  # delete
+            row = current[op.region_id]
+            op_results.append({
+                "index": i,
+                "action": "delete",
+                "region_id": op.region_id,
+                "version": int(row["version"]),  # 删除前 version
+                "_geom": None,
+            })
+
+    # 5) 拟变更完整集合：应用本批操作，未涉及区域原样保留；
+    #    每个区域带上引入该形态的操作下标（未涉及区域为 None）
+    candidate: list[dict] = []
+    for op in op_results:
+        if op["action"] == "delete":
+            continue
+        geom = dict(op["_geom"])
+        geom["operation_index"] = op["index"]
+        candidate.append(geom)
+    touched = {op["region_id"] for op in op_results if op["region_id"] is not None}
+    for rid in sorted(current):
+        if rid not in touched:
+            geom = _region_row_to_geom(current[rid])
+            geom["operation_index"] = None
+            candidate.append(geom)
+    # 现有区域按编号升序在前；拟登记区域（无正式编号）按操作下标排在最后
+    candidate.sort(
+        key=lambda r: (r["id"] is None,
+                       r["id"] if r["id"] is not None else r["operation_index"])
+    )
+
+    # 6) 逐轨迹在拟变更完整集合下核验（沿用直线匀速/边界接触即穿越/左闭右开）
+    trajectory_results: list[dict] = []
+    for ti, traj in enumerate(trajectories):
+        results = geometry.verify_trajectory(traj, candidate)
+        # verify_trajectory 保持 regions 顺序：把操作下标并入逐区域结果
+        for result, region in zip(results, candidate):
+            result["operation_index"] = region["operation_index"]
+        trajectory_results.append({
+            "index": ti,
+            "safe": all(len(r["crossings"]) == 0 for r in results),
+            "results": results,
+        })
+
+    # 7) 同一基准时刻评估凭证/承诺/观察（与正式提交同一套保护规则）
+    now = utcnow()
+    before_regions = [_region_row_to_geom(current[rid]) for rid in sorted(current)]
+    conflicting_pass_ids = find_conflicting_passes(cur, candidate, now)
+    conflicting_commitment_ids = find_conflicting_commitments(
+        cur, before_regions, candidate, now
+    )
+    observation_flips = compute_observation_flips(cur, before_regions, candidate, now)
+
+    # 以本次快照与基准时刻衡量，若立即正式提交是否会通过全部校验
+    # （轨迹安全且无凭证/承诺冲突）；观察翻转不阻止提交
+    committable = (
+        all(t["safe"] for t in trajectory_results)
+        and not conflicting_pass_ids
+        and not conflicting_commitment_ids
+    )
+    return {
+        "revision": current_revision,
+        "computed_at": now,
+        "committable": committable,
+        "operations": [
+            {k: v for k, v in op.items() if not k.startswith("_")}
+            for op in op_results
+        ],
+        "trajectory_results": trajectory_results,
+        "conflicting_pass_ids": conflicting_pass_ids,
+        "conflicting_commitment_ids": conflicting_commitment_ids,
+        "observation_flips": observation_flips,
+    }
