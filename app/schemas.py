@@ -459,6 +459,65 @@ class RegionBatchResponse(_UTCDatetimeModel):
     trajectories: list[TrajectoryCheckOut]
 
 
+# ---------------------------------------------------------------- 批量变更影响预演
+
+class BatchPreviewRegionResultOut(_UTCDatetimeModel):
+    """影响预演中单个区域的穿越明细。
+
+    拟登记（create）区域不分配正式编号：region_id 为 null，以
+    operation_index（操作下标）标识；其余区域 operation_index 为 null。
+    """
+
+    region_id: int | None
+    operation_index: int | None
+    region_name: str
+    crossings: list[CrossingOut]
+
+
+class BatchPreviewTrajectoryOut(_UTCDatetimeModel):
+    """单条待核验轨迹在拟变更完整区域集合下的安全结论与逐区域穿越明细。"""
+
+    index: int
+    safe: bool
+    results: list[BatchPreviewRegionResultOut]
+
+
+class BatchPreviewPassConflictOut(BaseModel):
+    """若提交将冲突的有效通行凭证（未取消且末点时刻未过）。"""
+
+    pass_id: int
+
+
+class BatchPreviewCommitmentConflictOut(BaseModel):
+    """若提交将被清空的择时承诺（变更前仍有未来安全时刻、变更后一点不剩）。"""
+
+    commitment_id: int
+
+
+class BatchPreviewObservationFlipOut(BaseModel):
+    """有效观察（未取消且末点时刻未过）在拟变更前后的结论净翻转。"""
+
+    observation_id: int
+    old_conclusion: str
+    new_conclusion: str
+
+
+class RegionBatchPreviewResponse(_UTCDatetimeModel):
+    """批量变更影响预演报告（只读，不产生任何副作用）。
+
+    revision 为预演所依据的已提交区域集合版本（与 expected_revision 一致）；
+    evaluated_at 为本次预演的基准时刻：凭证/承诺/观察的有效性判定与承诺
+    安全区间裁剪共用该时刻。
+    """
+
+    revision: int
+    evaluated_at: datetime
+    trajectories: list[BatchPreviewTrajectoryOut]
+    pass_conflicts: list[BatchPreviewPassConflictOut]
+    commitment_conflicts: list[BatchPreviewCommitmentConflictOut]
+    observation_flips: list[BatchPreviewObservationFlipOut]
+
+
 class RevisionOut(BaseModel):
     revision: int
 
